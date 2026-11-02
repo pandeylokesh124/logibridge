@@ -91,9 +91,27 @@ def on_message(client, userdata, msg):
         else:
             output_float = output_data.astype(np.float32)
 
+        # Get Class and Confidence
         predicted_class = int(np.argmax(output_float))
         confidence = float(np.max(output_float))
 
+        # Alert Logic for Operations Center & Cab Alarms
+        if predicted_class == 2:
+            print(f"[CRITICAL ALERT] Severe anomaly on {TRUCK_ID}! Confidence: {confidence:.2f}. Notifying Operations Center...")
+            # Optional: Publish to a dedicated urgent alert topic
+            alert_payload = {
+                "truck_id": TRUCK_ID,
+                "severity": "CRITICAL",
+                "timestamp": current_time,
+                "confidence": confidence,
+                "action_required": "Inspect cooling unit & driver contact immediately."
+            }
+            client.publish(f"logibridge/trucks/{TRUCK_ID}/alerts/critical", json.dumps(alert_payload), qos=2)
+
+        elif predicted_class == 1:
+            print(f"Temperature or vibration anomaly detected on {TRUCK_ID}. Confidence: {confidence:.2f}.")
+
+        # Publish Standard Inference Result
         result = {
             "timestamp": current_time,
             "class": predicted_class,
