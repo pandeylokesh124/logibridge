@@ -1,0 +1,5 @@
+numpy
+paho-mqtt
+scikit-learn
+tensorflow
+tensorflow-model-optimization

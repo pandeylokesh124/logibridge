@@ -1,0 +1,45 @@
+- name: Deploy LogiEdge Updates
+  hosts: edge_nodes
+  become: yes
+  tasks:
+    - name: Create /opt/logibridge directory if not present
+      file:
+        path: /opt/logibridge
+        state: directory
+        mode: '0755'
+
+    - name: Copy new model file to /opt/logibridge/model.tflite
+      copy:
+        src: ./local_models/model.tflite
+        dest: /opt/logibridge/model.tflite
+
+    - name: Copy updated reference_dist.json
+      copy:
+        src: ./monitoring/reference_dist.json
+        dest: /opt/logibridge/reference_dist.json
+
+    - name: Stop the running inference container if running
+      docker_container:
+        name: logiedge_inference
+        state: stopped
+      ignore_errors: yes
+
+    - name: Pull updated container image from local Docker registry
+      docker_image:
+        name: localhost:5000/logiedge_inference:latest
+        source: pull
+
+    - name: Start inference container with environment variables
+      docker_container:
+        name: logiedge_inference
+        image: localhost:5000/logiedge_inference:latest
+        state: started
+        env:
+          MODEL_PATH: "/opt/logibridge/model.tflite"
+
+    - name: Wait 15 seconds and verify container is running
+      command: docker inspect -f {%raw%}'{{.State.Running}}'{%endraw%} logiedge_inference
+      register: container_status
+      until: container_status.stdout == "true"
+      retries: 3
+      delay: 5
