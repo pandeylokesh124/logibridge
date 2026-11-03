@@ -107,10 +107,12 @@ def on_message(client, userdata, msg):
             else:
                 input_data = input_data.astype(np.int8)
 
-            # Model Execution
+            # Model Execution with Latency Tracking
+            start_time = time.perf_counter()
             interpreter.set_tensor(input_details[0]['index'], input_data)
             interpreter.invoke()
             output_data = interpreter.get_tensor(output_details[0]['index'])[0]
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
 
             # Dequantize INT8 output back to Float32
             output_scale, output_zero_point = output_details[0]['quantization']
@@ -124,7 +126,7 @@ def on_message(client, userdata, msg):
 
             # Alert Triggers
             if predicted_class == 2:
-                print(f"[CRITICAL ALERT] Severe anomaly on {TRUCK_ID}! Confidence: {confidence:.2f}. Notifying center ...")
+                print(f"[CRITICAL ALERT] Severe anomaly on {TRUCK_ID}! Confidence: {confidence:.2f} | Latency: {latency_ms:.2f}ms. Notifying center...")
                 alert_payload = {
                     "truck_id": TRUCK_ID,
                     "severity": "CRITICAL",
@@ -135,16 +137,25 @@ def on_message(client, userdata, msg):
                 client.publish(f"logibridge/trucks/{TRUCK_ID}/alerts/critical", json.dumps(alert_payload), qos=2)
 
             elif predicted_class == 1:
-                print(f"[WARNING] Anomaly detected on {TRUCK_ID}. Confidence: {confidence:.2f}")
+                print(f"[WARNING] Anomaly detected on {TRUCK_ID}. Confidence: {confidence:.2f} | Latency: {latency_ms:.2f}ms. Notify driver ...")
+                warning_payload = {
+                    "truck_id": TRUCK_ID,
+                    "severity": "WARNING",
+                    "timestamp": current_time,
+                    "confidence": confidence,
+                    "action_required": "Schedule routine maintenance check."
+                }
+                client.publish(f"logibridge/trucks/{TRUCK_ID}/alerts/warning", json.dumps(warning_payload), qos=1)
 
             # Publish Standard Prediction Payload
             result = {
                 "timestamp": current_time,
                 "class": predicted_class,
-                "confidence": confidence
+                "confidence": confidence,
+                "latency_ms": round(latency_ms, 2)
             }
             client.publish(f"logibridge/trucks/{TRUCK_ID}/inference", json.dumps(result), qos=1)
-            print(f"Inference published: Class {predicted_class} ({confidence:.2f})")
+            print(f"Inference published: Class {predicted_class} ({confidence:.2f}) in {latency_ms:.2f}ms")
 
 
 def main():
