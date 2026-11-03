@@ -1,45 +1,54 @@
-- name: Deploy LogiEdge Updates
-  hosts: edge_nodes
+---
+- name: LogiEdge OTA Deployment and Setup
+  hosts: truck_edge_nodes
   become: yes
+  vars:
+    app_dir: /opt/logibridge
+    model_file: "{{ playbook_dir }}/../optimisation/model_m2_ptq.tflite"
+    image_name: localhost:5000/logiedge_inference:latest
+
   tasks:
-    - name: Create /opt/logibridge directory if not present
-      file:
-        path: /opt/logibridge
+    - name: Ensure LogiEdge directory exists
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
         state: directory
         mode: '0755'
 
-    - name: Copy new model file to /opt/logibridge/model.tflite
-      copy:
-        src: ./local_models/model.tflite
-        dest: /opt/logibridge/model.tflite
+    - name: Copy TFLite model to edge node
+      ansible.builtin.copy:
+        src: "{{ model_file }}"
+        dest: "{{ app_dir }}/model.tflite"
+        mode: '0644'
 
-    - name: Copy updated reference_dist.json
-      copy:
-        src: ./monitoring/reference_dist.json
-        dest: /opt/logibridge/reference_dist.json
+    - name: Copy training statistics to edge node
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../data_pipeline/training_stats.npy"
+        dest: "{{ app_dir }}/training_stats.npy"
+        mode: '0644'
 
-    - name: Stop the running inference container if running
-      docker_container:
-        name: logiedge_inference
-        state: stopped
-      ignore_errors: yes
+    - name: Copy drift monitor reference distribution
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../monitoring/reference_dist.json"
+        dest: "{{ app_dir }}/reference_dist.json"
+        mode: '0644'
 
-    - name: Pull updated container image from local Docker registry
-      docker_image:
-        name: localhost:5000/logiedge_inference:latest
-        source: pull
-
-    - name: Start inference container with environment variables
-      docker_container:
-        name: logiedge_inference
-        image: localhost:5000/logiedge_inference:latest
+    - name: Ensure inference container is running with new model
+      community.docker.docker_container:
+        name: logibridge_inference
+        image: "{{ image_name }}"
         state: started
+        pull: never
+        recreate: true
+        restart_policy: always
+        etc_hosts:
+          host.docker.internal: "host-gateway"
         env:
           MODEL_PATH: "/opt/logibridge/model.tflite"
+          STATS_PATH: "/opt/logibridge/training_stats.npy"
+          MQTT_BROKER: "172.20.1.198"
 
-    - name: Wait 15 seconds and verify container is running
-      command: docker inspect -f {%raw%}'{{.State.Running}}'{%endraw%} logiedge_inference
-      register: container_status
-      until: container_status.stdout == "true"
-      retries: 3
-      delay: 5
+    - name: Verify container is actively running
+      ansible.builtin.command: docker inspect -f '{{ "{{ .State.Running }}" }}' logibridge_inference
+      register: verify_running
+      changed_when: false
+      failed_when: verify_running.stdout != 'true'

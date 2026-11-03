@@ -10,26 +10,31 @@ from collections import deque
 TRUCK_ID = "TRK-PH-017"
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 
-MODEL_PATH = os.getenv("MODEL_PATH", "model.tflite")
-STATS_PATH = os.getenv("STATS_PATH", "training_stats.npy")
+# Force absolute container paths as primary locations
+MODEL_PATH = "/opt/logibridge/model.tflite"
+STATS_PATH = "/opt/logibridge/training_stats.npy"
 
-# Fallback check for local host execution outside Docker
-if not os.path.exists(MODEL_PATH) and os.path.exists("../optimisation/model_m2_ptq.tflite"):
-    MODEL_PATH = "../optimisation/model_m2_ptq.tflite"
+# Fall back to environment variables if absolute paths aren't found (e.g., local testing)
+if not os.path.exists(MODEL_PATH) and os.getenv("MODEL_PATH"):
+    MODEL_PATH = os.getenv("MODEL_PATH")
 
-if not os.path.exists(STATS_PATH) and os.path.exists("../data_pipeline/training_stats.npy"):
-    STATS_PATH = "../data_pipeline/training_stats.npy"
+if not os.path.exists(STATS_PATH) and os.getenv("STATS_PATH"):
+    STATS_PATH = os.getenv("STATS_PATH")
 
+# Final verification checks
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model file not found at '{MODEL_PATH}'")
 
 if not os.path.exists(STATS_PATH):
     raise FileNotFoundError(f"Stats file not found at '{STATS_PATH}'")
 
-# Buffers for the 30-second sliding window
+# Buffers for the sliding window
 temp_buffer = deque(maxlen=30)
 vib_buffer = deque(maxlen=15)
 last_inference_time = time.time()
+
+temp_count = 0
+vib_count = 0
 
 # Load Model and Preprocessing Stats
 interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
@@ -55,70 +60,91 @@ def extract_features(temp_window, vib_window):
     return (features - stats['mean']) / stats['std']
 
 
-def on_message(client, userdata, msg):
-    global last_inference_time
-    payload = json.loads(msg.payload.decode())
+def on_connect(client, userdata, flags, rc, properties=None):
+    print(f"Connected to MQTT Broker successfully with code: {rc}")
+    # Subscribe to all logibridge topics to guarantee message capture
+    client.subscribe("logibridge/#")
+    print("Subscribed to topic wildcard: logibridge/#")
 
-    if "temperature" in msg.topic:
-        temp_buffer.append(payload["value"])
-    elif "vibration" in msg.topic:
-        vib_buffer.append(payload["value"])
+
+def on_message(client, userdata, msg):
+    global last_inference_time, temp_count, vib_count
+
+    print(f"[RECV] Topic: {msg.topic}")
+
+    try:
+        payload = json.loads(msg.payload.decode())
+    except Exception as e:
+        print(f"Failed to parse payload on {msg.topic}: {e}")
+        return
+
+    topic_lower = msg.topic.lower()
+    val = payload.get("value") if isinstance(payload, dict) else payload
+
+    if val is not None:
+        if "temperature" in topic_lower or "temp" in topic_lower:
+            temp_buffer.append(float(val))
+            temp_count += 1
+        elif "vibration" in topic_lower or "vib" in topic_lower:
+            vib_buffer.append(float(val))
+            vib_count += 1
 
     current_time = time.time()
-    if len(temp_buffer) == 30 and len(vib_buffer) == 15 and (current_time - last_inference_time >= 10):
-        last_inference_time = current_time
 
-        # Preprocess features
-        features = extract_features(list(temp_buffer), list(vib_buffer))
-        input_data = np.expand_dims(features, axis=0)
+    # Run inference when buffers are filled and 10 seconds have elapsed
+    if len(temp_buffer) == 30 and len(vib_buffer) == 15:
+        if current_time - last_inference_time >= 10:
+            last_inference_time = current_time
 
-        # Quantize Float32 input to INT8
-        input_scale, input_zero_point = input_details[0]['quantization']
-        if input_scale > 0:
-            input_data = np.clip(np.round(input_data / input_scale + input_zero_point), -128, 127).astype(np.int8)
-        else:
-            input_data = input_data.astype(np.int8)
+            # Feature Extraction
+            features = extract_features(list(temp_buffer), list(vib_buffer))
+            input_data = np.expand_dims(features, axis=0)
 
-        # Inference
-        interpreter.set_tensor(input_details[0]['index'], input_data)
-        interpreter.invoke()
-        output_data = interpreter.get_tensor(output_details[0]['index'])[0]
+            # Quantize Float32 input to INT8
+            input_scale, input_zero_point = input_details[0]['quantization']
+            if input_scale > 0:
+                input_data = np.clip(np.round(input_data / input_scale + input_zero_point), -128, 127).astype(np.int8)
+            else:
+                input_data = input_data.astype(np.int8)
 
-        # Dequantize INT8 output back to Float32
-        output_scale, output_zero_point = output_details[0]['quantization']
-        if output_scale > 0:
-            output_float = (output_data.astype(np.float32) - output_zero_point) * output_scale
-        else:
-            output_float = output_data.astype(np.float32)
+            # Model Execution
+            interpreter.set_tensor(input_details[0]['index'], input_data)
+            interpreter.invoke()
+            output_data = interpreter.get_tensor(output_details[0]['index'])[0]
 
-        # Get Class and Confidence
-        predicted_class = int(np.argmax(output_float))
-        confidence = float(np.max(output_float))
+            # Dequantize INT8 output back to Float32
+            output_scale, output_zero_point = output_details[0]['quantization']
+            if output_scale > 0:
+                output_float = (output_data.astype(np.float32) - output_zero_point) * output_scale
+            else:
+                output_float = output_data.astype(np.float32)
 
-        # Alert Logic for Operations Center & Cab Alarms
-        if predicted_class == 2:
-            print(f"[CRITICAL ALERT] Severe anomaly on {TRUCK_ID}! Confidence: {confidence:.2f}. Notifying Operations Center...")
-            # Optional: Publish to a dedicated urgent alert topic
-            alert_payload = {
-                "truck_id": TRUCK_ID,
-                "severity": "CRITICAL",
+            predicted_class = int(np.argmax(output_float))
+            confidence = float(np.max(output_float))
+
+            # Alert Triggers
+            if predicted_class == 2:
+                print(f"[CRITICAL ALERT] Severe anomaly on {TRUCK_ID}! Confidence: {confidence:.2f}. Notifying center ...")
+                alert_payload = {
+                    "truck_id": TRUCK_ID,
+                    "severity": "CRITICAL",
+                    "timestamp": current_time,
+                    "confidence": confidence,
+                    "action_required": "Inspect cooling unit & driver contact immediately."
+                }
+                client.publish(f"logibridge/trucks/{TRUCK_ID}/alerts/critical", json.dumps(alert_payload), qos=2)
+
+            elif predicted_class == 1:
+                print(f"[WARNING] Anomaly detected on {TRUCK_ID}. Confidence: {confidence:.2f}")
+
+            # Publish Standard Prediction Payload
+            result = {
                 "timestamp": current_time,
-                "confidence": confidence,
-                "action_required": "Inspect cooling unit & driver contact immediately."
+                "class": predicted_class,
+                "confidence": confidence
             }
-            client.publish(f"logibridge/trucks/{TRUCK_ID}/alerts/critical", json.dumps(alert_payload), qos=2)
-
-        elif predicted_class == 1:
-            print(f"Temperature or vibration anomaly detected on {TRUCK_ID}. Confidence: {confidence:.2f}.")
-
-        # Publish Standard Inference Result
-        result = {
-            "timestamp": current_time,
-            "class": predicted_class,
-            "confidence": confidence
-        }
-        client.publish(f"logibridge/trucks/{TRUCK_ID}/inference", json.dumps(result), qos=1)
-        print(f"Inference published: Class {predicted_class} ({confidence:.2f})")
+            client.publish(f"logibridge/trucks/{TRUCK_ID}/inference", json.dumps(result), qos=1)
+            print(f"Inference published: Class {predicted_class} ({confidence:.2f})")
 
 
 def main():
@@ -127,13 +153,13 @@ def main():
     except AttributeError:
         client = mqtt.Client()
 
+    client.on_connect = on_connect
     client.on_message = on_message
+
     client.connect(MQTT_BROKER, 1883, 60)
 
-    client.subscribe(f"logibridge/trucks/{TRUCK_ID}/sensors/temperature")
-    client.subscribe(f"logibridge/trucks/{TRUCK_ID}/sensors/vibration")
-
     print(f"LogiEdge Inference Service started using model: {MODEL_PATH}")
+    print(f"Connected to broker: {MQTT_BROKER}:1883")
     print("Listening for sensor data...")
     client.loop_forever()
 

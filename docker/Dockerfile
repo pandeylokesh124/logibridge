@@ -1,21 +1,18 @@
 FROM python:3.11-slim
 
 WORKDIR /opt/logibridge
+ENV PYTHONUNBUFFERED=1
 
-# 1. Install dependencies first to cache this layer
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 2. Copy inference script
+# Copy files from their exact host directories into the container workdir
 COPY inference/inference_service.py .
-
-# 3. Copy normalization stats required by inference script
 COPY data_pipeline/training_stats.npy .
-
-# 4. Copy model last to maximize layer caching during OTA updates
-# Renaming it to model.tflite in the destination container
 COPY optimisation/model_m2_ptq.tflite ./model.tflite
 
 ENV MODEL_PATH="/opt/logibridge/model.tflite"
+ENV STATS_PATH="/opt/logibridge/training_stats.npy"
+ENV MQTT_BROKER="host.docker.internal"
 
 CMD ["python", "inference_service.py"]
